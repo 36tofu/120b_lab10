@@ -13,6 +13,16 @@
 #include "simAVRHeader.h"
 #endif
 
+
+/*
+ *
+ * PC0 1 2 3 
+ * PC1 4 5 6
+ * PC2 7 8 9
+ * PC3 * 0 #
+*/
+
+
 unsigned char GetKeypadKey(){
 	pORTC = 0xEF;
 	asm("nop");
