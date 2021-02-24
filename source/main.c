@@ -15,6 +15,37 @@
 #include "simAVRHeader.h"
 #endif
 
+void set_PWM(double frequency){
+	static double current_frequency;
+
+	if (frequency != current_frequency) {
+		if (!frequency) { TCCR3B &= 0x08; }
+		else {TCCR3B |= 0x03; }
+
+		if (frequency < 0.954) { OCR3A = 0xFFFF; }
+
+		else if (frequency > 31250) { OCR3A = 0x0000; }
+
+		else { OCR3A = (short)(8000000 / (128 * frequency)) - 1; }
+
+		TCNT3 = 0;
+		current_frequency = frequency; 
+	}
+}
+
+void PWM_on(){
+	TCCR3A = (1 << COM3A0);
+
+	TCCR3B = (1 << WGM32) | (1 << CS31) | (1 << CS30);
+
+	set_PWM(0);
+}
+
+void PWM_off(){
+	TCCR3A = 0x00;
+	TCCR3B = 0x00;
+}
+
 unsigned long _avr_timer_M = 1; //start count from here, down to 0. Dft 1ms
 unsigned long _avr_timer_cntcurr = 0; //Current internal count of 1ms ticks
 
@@ -64,13 +95,16 @@ typedef struct task {
   int (*TickFct)(int); // Function to call for task's tick
 } task;
 
-task tasks[3];
+task tasks[4];
 
-const unsigned char tasksNum = 3;
+const unsigned char tasksNum = 4;
 
 
 const unsigned long tasksPeriodGCD = 1;
 const unsigned long periodKP = 100;
+const unsigned long periodSQ = 50;
+const unsigned long periodIS = 100;
+const unsigned long periodSample = 200;
 
 /*
 const unsigned long periodThreeLEDs = 300;
@@ -85,10 +119,14 @@ int TickFct_KP(int state);
 enum SQ_States { SQ_SMStart, SQ_init, SQ_begin, SQ_wait, SQ_check, SQ_match };
 int TickFct_detectSQ(int state);
 
-/*
-enum combined_States { C_SMStart, C_s1 };
-int TickFct_Combined(int state);
 
+enum IS_States { IS_SMStart, IS_unlock, IS_lock };
+int TickFct_IS(int state);
+
+
+enum OnOff_States { OnOff_SMStart, s_Off, s_On};
+int TickFct_OnOff(int state);
+/*
 enum SP_States { SP_SMStart, SP_s0, SP_s1};
 int TickFct_Speaker(int state);
 
@@ -117,7 +155,7 @@ void TimerISR() {
  * PC3 * 0 # D
 */
 
-
+/*
 unsigned char GetKeypadKey(){
 	PORTC = 0xEF;
 	asm("nop");
@@ -149,7 +187,41 @@ unsigned char GetKeypadKey(){
 
 	return('\0');
 }
+*/
 
+unsigned char GetKeypadKey(){
+	unsigned char star = 0;
+	PORTC = 0xEF;
+	asm("nop");
+	//if ((PINC & 8)==0) { return('*');}
+	if ((PINC & 8)==0) { star = 1; }
+	if ((PINC & 1)==0) {if(star == 1) return('a'); else return('1');}
+	if ((PINC & 2)==0) {if(star == 1) return('d'); else return('4');}
+	if ((PINC & 4)==0) {if(star == 1) return('g'); else return('7');}
+
+	PORTC = 0xDF;
+	asm("nop");
+	if ((PINC & 1)==0) {if(star == 1) return('b'); else return('2');}
+	if ((PINC & 2)==0) {if(star == 1) return('e'); else return('5');}
+	if ((PINC & 4)==0) {if(star == 1) return('h'); else return('8');}
+	if ((PINC & 8)==0) {if(star == 1) return('`'); else return('0');}
+
+	PORTC = 0xBF;
+	asm("nop");
+	if ((PINC & 1)==0) {if(star == 1) return('c'); else return('3');}
+	if ((PINC & 2)==0) {if(star == 1) return('f'); else return('6');}
+	if ((PINC & 4)==0) {if(star == 1) return('i'); else return('9');}
+	if ((PINC & 8)==0) { return('#');}
+
+	PORTC = 0x7F;
+	asm("nop");
+	if ((PINC & 1)==0) { return('A');}
+	if ((PINC & 2)==0) { return('B');}
+	if ((PINC & 4)==0) { return('C');}
+	if ((PINC & 8)==0) { return('D');}
+
+	if(star == 1) return('*'); else return('\0');
+}
 //Queue Functions 
 typedef struct _Q7uc {
    unsigned char buf[7];
@@ -180,10 +252,10 @@ void Q7ucPrint(Q7uc Q) {
 void Q7ucPush(Q7uc *Q,
                   unsigned char item) {
    if (!Q7ucFull(*Q)) {
-      DisableInterrupts();
+      //DisableInterrupts();
       (*Q).buf[(*Q).cnt] = item;
       (*Q).cnt++;
-      EnableInterrupts();
+      //EnableInterrupts();
    }
 }
 
@@ -192,7 +264,7 @@ unsigned char Q7ucPop(Q7uc *Q)
    int i;
    unsigned char item=0;
    if (!Q7ucEmpty(*Q)) {
-      DisableInterrupts();
+      //DisableInterrupts();
       item = (*Q).buf[0];
       (*Q).cnt--;
       for (i=0; i<(*Q).cnt; i++) {
@@ -200,33 +272,70 @@ unsigned char Q7ucPop(Q7uc *Q)
          (*Q).buf[i]=
          (*Q).buf[i+1];
       }
-      EnableInterrupts();
+      //EnableInterrupts();
    }
    return(item);
 }
 
-unsigned char tmpDT1;
-unsigned char tmpDT2;
+unsigned char tmpBUL;
+unsigned char t2unlock; //0 = locked    1 = unlocked
 unsigned char tmpBT1;
 unsigned char keyPressed;
 Q7uc btnQ;
 
-int main() {
 
+unsigned char sequ[] = {'#','1','2','3','4','5'};
+//unsigned char sequ[6];
+//sequ[0] = '#';
+//sequ[1] = '1';
+//sequ[2] = '2';
+//sequ[3] = '3';
+//sequ[4] = '4';
+//sequ[5] = '5';
+#define MAXCOUNT 30
+double frequency[9] = {0, 261.63, 293.66, 329.63, 349.23, 392.0, 440.0, 493.88, 523.25};
+unsigned short keySeq[MAXCOUNT] = {1,1,1,1,5,5,5,5,4,3,2,8,8,8,8,5,5,4,3,2,8,8,8,8,5,5,4,3,4,2};
+unsigned short count = 0;
+
+
+int main() {
+ 
+
+  DDRA = 0x00; PORTA = 0x03;
   DDRC = 0xF0; PORTC = 0x0F;
-  DDRB = 0x80; PORTB = 0x00;
+  //DDRB = 0xC1; PORTB = 0x00;
+  DDRB = 0x05; PORTB = 0x00;
   unsigned char i=0;
+  tasks[i].state = OnOff_SMStart;
+  tasks[i].period = periodSample;
+  tasks[i].elapsedTime = tasks[i].period;
+  tasks[i].TickFct = &TickFct_OnOff;
+  ++i;
   tasks[i].state = KP_SMStart;
   tasks[i].period = periodKP;
   tasks[i].elapsedTime = tasks[i].period;
   tasks[i].TickFct = &TickFct_KP;
+  ++i;
+  tasks[i].state = SQ_SMStart;
+  tasks[i].period = periodSQ;
+  tasks[i].elapsedTime = tasks[i].period;
+  tasks[i].TickFct = &TickFct_detectSQ;
+  ++i;
+  tasks[i].state = IS_SMStart;
+  tasks[i].period = periodIS;
+  tasks[i].elapsedTime = tasks[i].period;
+  tasks[i].TickFct = &TickFct_IS;
   
+  //TimerSet(tasksPeriodGCD);
+  
+  Q7ucInit(&btnQ);
+  PWM_on();
   TimerOn();
 
   
   
   while(1) {
-     PORTB = tmpBT1;
+     PORTB = tmpBT1 | t2unlock;
   }
   return 0;
 }
@@ -242,7 +351,7 @@ int TickFct_KP(int state) {
 		state = KP_wait;
 	else{ 
 		state = KP_pressed;
-		if(!Q7ucFULL(btnQ)){
+		if(!Q7ucFull(btnQ)){
 			Q7ucPush(&btnQ, keyPressed);
 		}
 	}
@@ -259,9 +368,10 @@ int TickFct_KP(int state) {
    } // Transitions
   switch(state) { // State actions
      case KP_wait:
+        tmpBT1 = 0x00;
         break;
      case KP_pressed:
-        tmpBT1 = 0x80;
+        tmpBT1 = 0x04;
 	break;
      default:
         break;
@@ -272,7 +382,8 @@ int TickFct_KP(int state) {
 
 int TickFct_detectSQ(int state) {
   unsigned char recBtn;
-  const unsigned char seq[7] = {1,2,3,4,5};
+  
+//unsigned char sequ[6] = {'#','1','2','3','4','5'};
   static unsigned char i = 0;
   switch(state) { // Transitions
      case SQ_SMStart: // Initial transition
@@ -288,11 +399,12 @@ int TickFct_detectSQ(int state) {
 	if(Q7ucEmpty(btnQ))state = SQ_wait;
 	else{
 		recBtn = Q7ucPop(&btnQ);
-		state = SQ_Check;
+		state = SQ_check;
 	}
         break;
      case SQ_check:
-	if(recBtn == seq[i])state = SQ_match;
+	if(recBtn == sequ[i])state = SQ_match;
+	//if(recBtn == *(seq+i))state = SQ_match;
 	else state = SQ_begin;
         break;
      case SQ_match:
@@ -300,60 +412,109 @@ int TickFct_detectSQ(int state) {
 		i++;
 		state = SQ_wait;
 	}
-	else state = SQ_begin;
+	else{
+		state = SQ_begin;
+		t2unlock = 1;
+	}
         break;
      default:
         state = SQ_SMStart;
    } // Transitions
-//WE WERE HERE SATURDAY NIGHT
-//FINISH STATE ACTIONS 
-//INIT QUEUE 
+
   switch(state) { // state actions
      case SQ_SMStart: // 
         break;
      case SQ_init:
-	i = 0;
+	t2unlock = 0;
         break;
      case SQ_begin:
-        state = SQ_wait;
+	i = 0;
         break;
      case SQ_wait:
-	if(Q7ucEmpty(btnQ))state = SQ_wait;
-	else{
-		recBtn = Q7ucPop(&btnQ);
-		state = SQ_Check;
-	}
         break;
      case SQ_check:
-	if(recBtn == seq[i])state = SQ_match;
-	else state = SQ_begin;
-        break;
+	break;
      case SQ_match:
-	if(i!=5){
-		i++;
-		state = SQ_wait;
-	}
-	else state = SQ_begin;
         break;
      default:
         state = SQ_SMStart;
    } // Transitions
+  return state;
+}
+
+
+int TickFct_IS(int state) {
+  switch(state) { // Transitions
+     case IS_SMStart: // Initial transition
+        state = IS_unlock;
+        break;
+     case IS_unlock:
+	if(~PINA & 0x01 == 1) state = IS_lock;
+	else state = IS_unlock;
+        break;
+     case IS_lock:
+	if(~PINA & 0x01 == 1) state = IS_lock;
+	else state = IS_unlock;
+        break;
+     default:
+        state = IS_SMStart;
+   } // Transitions
   switch(state) { // State actions
-     case SQ_s1:
-	tmpDT2 = 0x01;
+     case IS_unlock:
         break;
-     case SQ_s2:
-	tmpDT2 = 0x02;
+     case IS_lock:
+	t2unlock = 0;
+	break;
+     default:
         break;
-     case SQ_s3:
-	tmpDT2 = 0x04;
+  } // State actions
+  //PORTD = tmpDT1;
+  return state;
+}
+
+
+int TickFct_OnOff(int state) {
+  unsigned char tmpA = (~PINA & 0x02); 
+  switch(state) { // Transitions
+     case OnOff_SMStart: // Initial transition
+        state = s_Off;
+        break;
+     case s_Off:
+	count = 0;
+	if (tmpA == 0x02) state = s_On;
+	else state = s_Off;
+        break;
+     case s_On:
+	if (count < MAXCOUNT-1) {
+		count++;
+		state = s_On;
+	}
+	else{
+		count = 0;
+		state = s_Off;
+	}
+        break;
+     default:
+        state = OnOff_SMStart;
+	break;
+   } // Transitions
+
+  switch(state) { // State actions
+     case OnOff_SMStart: // Initial transition
+        break;
+     case s_Off:
+	set_PWM(0);
+        break;
+     case s_On:
+	set_PWM(frequency[keySeq[count]]);
         break;
      default:
         break;
   } // State actions
-  //PORTD = tmpDT2;
   return state;
 }
+
+
 
 /*
 int TickFct_Combined(int state) {
